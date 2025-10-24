@@ -4,7 +4,7 @@ use std::vec::Vec;
 /// The indexed bitmap.
 ///
 /// The core of this data structure is a bitmap, but we build
-/// index to accelerate search operations for zero and ones.
+/// index to accelerate search operations for zeroes and ones.
 pub struct IndexedBitmap {
     bitmap: Vec<u128>,
     index: Vec<Vec<u128>>,
@@ -231,6 +231,37 @@ impl IndexedBitmap {
     pub fn size(&self) -> usize {
         self.highest_one().map_or(0, |x| x + 1)
     }
+
+    fn lowest_one_page(&self) -> Option<usize> {
+        let mut page = 0;
+        let num_layers = self.index.len();
+        for i in 0..num_layers {
+            let layer = num_layers - i - 1;
+            if page >= self.index[layer].len() {
+                return None;
+            }
+            let mut next_page = page << 6;
+            let target = self.index[layer][page];
+            let off = (target.trailing_zeros() >> 1) as usize;
+            next_page += off;
+            page = next_page;
+        }
+        if page < self.bitmap.len() && self.bitmap[page] != 0 {
+            Some(page)
+        } else {
+            None
+        }
+    }
+
+    pub fn lowest_one(&self) -> Option<usize> {
+        if let Some(page) = self.lowest_one_page() {
+            let target = self.bitmap[page];
+            assert!(target != 0);
+            Some((page << 7) + target.trailing_zeros() as usize)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +272,7 @@ mod tests {
     fn test_operations_1() {
         let mut bitmap = IndexedBitmap::new();
         assert_eq!(bitmap.lowest_zero(), 0);
+        assert_eq!(bitmap.lowest_one(), None);
         assert_eq!(bitmap.highest_one(), None);
         assert_eq!(bitmap.size(), 0);
 
@@ -252,6 +284,7 @@ mod tests {
         assert_eq!(bitmap.bitmap[0], 0b011);
         assert_eq!(bitmap.index.len(), 0);
         assert_eq!(bitmap.lowest_zero(), 2);
+        assert_eq!(bitmap.lowest_one(), Some(0));
         assert_eq!(bitmap.highest_one(), Some(1));
         assert_eq!(bitmap.size(), 2);
 
@@ -265,6 +298,7 @@ mod tests {
         assert_eq!(bitmap.index[0].len(), 1);
         assert_eq!(bitmap.index[0][0], 0b0101);
         assert_eq!(bitmap.lowest_zero(), 2);
+        assert_eq!(bitmap.lowest_one(), Some(0));
         assert_eq!(bitmap.highest_one(), Some(128));
         assert_eq!(bitmap.size(), 129);
 
@@ -279,6 +313,7 @@ mod tests {
         assert_eq!(bitmap.index[0].len(), 1);
         assert_eq!(bitmap.index[0][0], 0b01);
         assert_eq!(bitmap.lowest_zero(), 2);
+        assert_eq!(bitmap.lowest_one(), Some(0));
         assert_eq!(bitmap.highest_one(), Some(1));
         assert_eq!(bitmap.size(), 2);
 
@@ -286,6 +321,7 @@ mod tests {
         // zero is the first bit.
         bitmap.bitset(1, false);
         assert_eq!(bitmap.lowest_zero(), 1);
+        assert_eq!(bitmap.lowest_one(), Some(0));
         assert_eq!(bitmap.highest_one(), Some(0));
         assert_eq!(bitmap.size(), 1);
 
@@ -293,6 +329,7 @@ mod tests {
         // to see whether it works normally.
         bitmap.bitset(0, false);
         assert_eq!(bitmap.lowest_zero(), 0);
+        assert_eq!(bitmap.lowest_one(), None);
         assert_eq!(bitmap.highest_one(), None);
         assert_eq!(bitmap.size(), 0);
     }
@@ -302,29 +339,38 @@ mod tests {
         let mut bitmap = IndexedBitmap::new();
         let upper_bound = 300000usize;
         assert_eq!(bitmap.lowest_zero(), 0);
+        assert_eq!(bitmap.lowest_one(), None);
         assert_eq!(bitmap.highest_one(), None);
         for i in 0..upper_bound {
             bitmap.bitset(i, true);
             assert_eq!(bitmap.lowest_zero(), i + 1);
+            assert_eq!(bitmap.lowest_one(), Some(0));
             assert_eq!(bitmap.highest_one(), Some(i));
         }
         assert_eq!(bitmap.lowest_zero(), upper_bound);
+        assert_eq!(bitmap.lowest_one(), Some(0));
         assert_eq!(bitmap.highest_one(), Some(upper_bound - 1));
         for i in 0..upper_bound {
             bitmap.bitset(i, false);
             assert_eq!(bitmap.lowest_zero(), i);
+            assert_eq!(bitmap.lowest_one(), Some(if i == 0 { 1 } else { 0 }),);
             assert_eq!(
                 bitmap.highest_one(),
                 Some(upper_bound - 2 + (if i == upper_bound - 1 { 0 } else { 1 })),
             );
             bitmap.bitset(i, true);
             assert_eq!(bitmap.lowest_zero(), upper_bound);
+            assert_eq!(bitmap.lowest_one(), Some(0));
             assert_eq!(bitmap.highest_one(), Some(upper_bound - 1),);
         }
         for i in 0..upper_bound {
             let target = upper_bound - i - 1;
             bitmap.bitset(target, false);
             assert_eq!(bitmap.lowest_zero(), target);
+            assert_eq!(
+                bitmap.lowest_one(),
+                if target == 0 { None } else { Some(0) },
+            );
             assert_eq!(bitmap.size(), target);
         }
     }
@@ -332,14 +378,18 @@ mod tests {
     #[test]
     fn test_operations_3() {
         let mut bitmap = IndexedBitmap::new();
+        assert_eq!(bitmap.lowest_one(), None);
         assert_eq!(bitmap.highest_one(), None);
         bitmap.bitset(0, true);
         bitmap.bitset(0, false);
+        assert_eq!(bitmap.lowest_one(), None);
         assert_eq!(bitmap.highest_one(), None);
         for i in 0..32 {
             bitmap.bitset(1 << i, true);
+            assert_eq!(bitmap.lowest_one(), Some(1 << i));
             assert_eq!(bitmap.highest_one(), Some(1 << i));
             bitmap.bitset(1 << i, false);
+            assert_eq!(bitmap.lowest_one(), None);
             assert_eq!(bitmap.highest_one(), None);
         }
     }
