@@ -235,35 +235,56 @@ impl IndexedBitmap {
         self.highest_one().map_or(0, |x| x + 1)
     }
 
-    fn lowest_one_page(&self) -> Option<usize> {
-        let mut page = 0;
-        let num_layers = self.index.len();
-        for i in 0..num_layers {
-            let layer = num_layers - i - 1;
-            if page >= self.index[layer].len() {
-                return None;
-            }
-            let mut next_page = page << 6;
-            let target = self.index[layer][page];
-            let off = (target.trailing_zeros() >> 1) as usize;
-            next_page += off;
-            page = next_page;
+    // XXX: This function does not handle the case when
+    // there's zero or one index page(s), since there's no
+    // index to walk while this function must walk the index.
+    // Therefore, that case must be handled separately.
+    fn walk_index_for_one(&self, layer: usize, page: usize) -> Option<usize> {
+        if layer >= self.index.len() {
+            return None;
         }
-        if page < self.bitmap.len() && self.bitmap[page] != 0 {
-            Some(page)
-        } else {
-            None
+        let p = page >> 6;
+        let off = page & 63;
+        if p >= self.index[layer].len() {
+            return None;
         }
+        let mut target = self.index[layer][p];
+        let mask = (1u128 << (off << 1)).wrapping_sub(1);
+        target |= mask;
+        target ^= mask;
+        if target != 0 {
+            return Some((p << 6) + (target.trailing_zeros() >> 1) as usize);
+        }
+        let p = self.walk_index_for_one(layer + 1, p + 1)?;
+        let target = self.index[layer][p];
+        assert!(target != 0);
+        Some((p << 6) + (target.trailing_zeros() >> 1) as usize)
+    }
+
+    pub fn this_one_or_next_one(&self, n: usize) -> Option<usize> {
+        let mut page = n >> 7;
+        let off = n & 127;
+        if page >= self.bitmap.len() {
+            return None;
+        }
+        let mut target = self.bitmap[page];
+        let mask = (1u128 << off).wrapping_sub(1);
+        target |= mask;
+        target ^= mask;
+        if target == 0 {
+            page = self.walk_index_for_one(0, page + 1)?;
+            target = self.bitmap[page];
+            assert!(target != 0);
+        }
+        Some((page << 7) + target.trailing_zeros() as usize)
     }
 
     pub fn lowest_one(&self) -> Option<usize> {
-        if let Some(page) = self.lowest_one_page() {
-            let target = self.bitmap[page];
-            assert!(target != 0);
-            Some((page << 7) + target.trailing_zeros() as usize)
-        } else {
-            None
-        }
+        self.this_one_or_next_one(0)
+    }
+
+    pub fn next_one(&self, n: usize) -> Option<usize> {
+        self.this_one_or_next_one(n + 1)
     }
 
     fn shrink_to_page(&mut self, num_pages: usize) {
@@ -399,7 +420,7 @@ mod tests {
         for i in 0..upper_bound {
             bitmap.bitset(i, false);
             assert_eq!(bitmap.lowest_zero(), i);
-            assert_eq!(bitmap.lowest_one(), Some(if i == 0 { 1 } else { 0 }),);
+            assert_eq!(bitmap.lowest_one(), Some(if i == 0 { 1 } else { 0 }));
             assert_eq!(
                 bitmap.highest_one(),
                 Some(upper_bound - 2 + (if i == upper_bound - 1 { 0 } else { 1 })),
@@ -517,5 +538,21 @@ mod tests {
         bitmap.bitset(128, false);
         bitmap.shrink_to_fit();
         verify_layer_0(&bitmap);
+    }
+
+    #[test]
+    fn test_operations_5() {
+        let mut bitmap = IndexedBitmap::new();
+        for i in 0..32 {
+            bitmap.bitset(1 << i, true);
+            assert_eq!(bitmap.lowest_one(), Some(1));
+            for j in 0..i {
+                assert_eq!(bitmap.next_one(1 << j), Some(1 << (j + 1)));
+            }
+            assert_eq!(bitmap.next_one(1 << i), None);
+            for j in 2..i {
+                assert_eq!(bitmap.next_one((1usize << j).wrapping_sub(1)), Some(1 << j));
+            }
+        }
     }
 }
