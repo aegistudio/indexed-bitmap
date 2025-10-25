@@ -1,3 +1,4 @@
+use std::cmp::max;
 use std::mem::swap;
 use std::vec::Vec;
 
@@ -109,17 +110,19 @@ impl IndexedBitmap {
         }
     }
 
-    pub fn bitset(&mut self, n: usize, set: bool) {
+    pub fn bitset(&mut self, n: usize, set: bool) -> bool {
         self.reverse_n_bits(n + 1);
         let p = n >> 7;
         let off = n & 127;
         let page = self.bitmap[p];
         let mask = 1u128 << off;
+        let previous = (page & mask) != 0;
         let new_page = (page | mask) ^ (if set { 0 } else { mask });
         if page != new_page {
             self.bitmap[p] = new_page;
             self.refresh_index_page(p);
         }
+        previous
     }
 
     pub fn bitget(&self, n: usize) -> bool {
@@ -262,6 +265,44 @@ impl IndexedBitmap {
             None
         }
     }
+
+    fn shrink_to_page(&mut self, num_pages: usize) {
+        self.bitmap.truncate(max(self.page_size(), num_pages));
+        self.bitmap.shrink_to_fit();
+        let num_layers = self.index.len();
+        for layer in 0..num_layers {
+            let num_pages = self.get_previous_layer(layer).len();
+            if num_pages <= 1 {
+                self.index.truncate(layer);
+                self.index.shrink_to_fit();
+                break;
+            }
+            self.index[layer].truncate((num_pages + 63) >> 6);
+            self.index[layer].shrink_to_fit();
+        }
+    }
+
+    /// Shrink to the specified size of holding the set pages.
+    ///
+    /// When operating, it's possible that some zero pages in
+    /// bitmap and index are present. They are usually created
+    /// when previous operations touches these pages. In that
+    /// case, we will view these pages as would be touched in
+    /// near future, so we won't proactively shrink them. In
+    /// fact, doing so it reduces unnecessary memory allocations.
+    ///
+    /// However, it's not always reasonable that the touched
+    /// pages remains there indefinitely. So we offer this
+    /// function so that the caller can recycle the
+    /// excess zero pages.
+    pub fn shrink_to(&mut self, n: usize) {
+        self.shrink_to_page((n + 127) >> 7)
+    }
+
+    /// Shrink to the minimum size of holding the set pages.
+    pub fn shrink_to_fit(&mut self) {
+        self.shrink_to_page(0)
+    }
 }
 
 #[cfg(test)]
@@ -332,6 +373,11 @@ mod tests {
         assert_eq!(bitmap.lowest_one(), None);
         assert_eq!(bitmap.highest_one(), None);
         assert_eq!(bitmap.size(), 0);
+
+        // Now let's see if the shrink_to_fit works.
+        bitmap.shrink_to_fit();
+        assert_eq!(bitmap.bitmap.len(), 0);
+        assert_eq!(bitmap.index.len(), 0);
     }
 
     #[test]
@@ -392,5 +438,84 @@ mod tests {
             assert_eq!(bitmap.lowest_one(), None);
             assert_eq!(bitmap.highest_one(), None);
         }
+    }
+
+    #[test]
+    fn test_operations_4() {
+        let mut bitmap = IndexedBitmap::new();
+
+        // Extend 3 layers of bitmap and see if it works.
+        bitmap.bitset(1, true);
+        bitmap.bitset(127, true);
+        let verify_layer_0 = |bitmap: &IndexedBitmap| {
+            assert_eq!(bitmap.bitget(1), true);
+            assert_eq!(bitmap.bitget(127), true);
+            assert_eq!(bitmap.size(), 128);
+            assert_eq!(bitmap.index.len(), 0);
+        };
+        verify_layer_0(&bitmap);
+        bitmap.bitset(128, true);
+        let verify_layer_1 = |bitmap: &IndexedBitmap| {
+            assert_eq!(bitmap.bitget(1), true);
+            assert_eq!(bitmap.bitget(127), true);
+            assert_eq!(bitmap.bitget(128), true);
+            assert_eq!(bitmap.size(), 129);
+            assert_eq!(bitmap.index.len(), 1);
+            assert_eq!(bitmap.index[0].len(), 1);
+            assert_eq!(bitmap.index[0][0], 0b0101);
+        };
+        verify_layer_1(&bitmap);
+        bitmap.bitset(8192, true);
+        let verify_layer_2 = |bitmap: &IndexedBitmap| {
+            assert_eq!(bitmap.bitget(1), true);
+            assert_eq!(bitmap.bitget(127), true);
+            assert_eq!(bitmap.bitget(128), true);
+            assert_eq!(bitmap.bitget(8192), true);
+            assert_eq!(bitmap.size(), 8193);
+            assert_eq!(bitmap.index.len(), 2);
+            assert_eq!(bitmap.index[0].len(), 2);
+            assert_eq!(bitmap.index[0][0], 0b0101);
+            assert_eq!(bitmap.index[0][1], 0b01);
+            assert_eq!(bitmap.index[1].len(), 1);
+            assert_eq!(bitmap.index[1][0], 0b0101);
+        };
+        verify_layer_2(&bitmap);
+        bitmap.bitset(524288, true);
+        let verify_layer_3 = |bitmap: &IndexedBitmap| {
+            assert_eq!(bitmap.bitget(1), true);
+            assert_eq!(bitmap.bitget(127), true);
+            assert_eq!(bitmap.bitget(128), true);
+            assert_eq!(bitmap.bitget(8192), true);
+            assert_eq!(bitmap.bitget(524288), true);
+            assert_eq!(bitmap.size(), 524289);
+            assert_eq!(bitmap.index.len(), 3);
+            assert_eq!(bitmap.index[0].len(), 65);
+            assert_eq!(bitmap.index[0][0], 0b0101);
+            assert_eq!(bitmap.index[0][1], 0b01);
+            assert_eq!(bitmap.index[0][64], 0b01);
+            assert_eq!(bitmap.index[2].len(), 1);
+            assert_eq!(bitmap.index[2][0], 0b0101);
+        };
+        verify_layer_3(&bitmap);
+
+        // Attempt to shrink to some values and
+        // see if it mutates the bitmap.
+        bitmap.shrink_to(1);
+        verify_layer_3(&bitmap);
+        bitmap.shrink_to(1048576);
+        verify_layer_3(&bitmap);
+
+        // Do some real shrinking work.
+        bitmap.bitset(524288, false);
+        bitmap.shrink_to_fit();
+        // layer 3 will be evicted.
+        verify_layer_2(&bitmap);
+        bitmap.bitset(8192, false);
+        bitmap.shrink_to_fit();
+        // layer 2 will be evicted.
+        verify_layer_1(&bitmap);
+        bitmap.bitset(128, false);
+        bitmap.shrink_to_fit();
+        verify_layer_0(&bitmap);
     }
 }
